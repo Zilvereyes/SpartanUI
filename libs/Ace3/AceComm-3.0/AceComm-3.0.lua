@@ -1,5 +1,5 @@
---- **AceComm-3.0** allows you to send messages of unlimited length over the addon comm channels.
--- It'll automatically split the messages into multiple parts and rebuild them on the receiving end.\\
+--- **AceComm-3.0** allows you to send messages longer than one addon-message packet.
+-- It'll automatically split messages into multiple parts and rebuild bounded messages on the receiving end.\\
 -- **ChatThrottleLib** is of course being used to avoid being disconnected by the server.
 --
 -- **AceComm-3.0** can be embeded into your addon, either explicitly by calling AceComm:Embed(MyAddon) or by
@@ -11,22 +11,17 @@
 -- @name AceComm-3.0
 -- @release $Id$
 
---[[ AceComm-3.0
-
-TODO: Time out old data rotting around from dead senders? Not a HUGE deal since the number of possible sender names is somewhat limited.
-
-]]
-
 local CallbackHandler = LibStub("CallbackHandler-1.0")
 local CTL = assert(ChatThrottleLib, "AceComm-3.0 requires ChatThrottleLib")
 
-local MAJOR, MINOR = "AceComm-3.0", 14
+local MAJOR, MINOR = "AceComm-3.0", 15
 local AceComm,oldminor = LibStub:NewLibrary(MAJOR, MINOR)
 
 if not AceComm then return end
 
 -- Lua APIs
 local type, next, pairs, tostring = type, next, pairs, tostring
+local rawget = rawget
 local strsub, strfind = string.sub, string.find
 local match = string.match
 local tinsert, tconcat = table.insert, table.concat
@@ -34,6 +29,7 @@ local error, assert = error, assert
 
 -- WoW APIs
 local Ambiguate = Ambiguate
+local GetTime = GetTime
 
 AceComm.embeds = AceComm.embeds or {}
 
@@ -47,8 +43,23 @@ local MSG_ESCAPE = "\004"
 AceComm.multipart_origprefixes = nil
 AceComm.multipart_reassemblers = nil
 
--- the multipart message spool: indexed by a combination of sender+distribution+
-AceComm.multipart_spool = AceComm.multipart_spool or {}
+-- Bound incomplete remote messages. The byte limits include payload only; part and
+-- stream limits also bound table/key overhead from empty or highly fragmented input.
+local MAX_MULTIPART_BYTES = 1024 * 1024
+local MAX_MULTIPART_PARTS = 4096
+local MAX_SENDER_BYTES = 2 * 1024 * 1024
+local MAX_SENDER_PARTS = 8192
+local MAX_SENDER_STREAMS = 4
+local MAX_GLOBAL_BYTES = 4 * 1024 * 1024
+local MAX_GLOBAL_PARTS = 16384
+local MAX_GLOBAL_STREAMS = 64
+local MAX_GLOBAL_SENDERS = 64
+local MAX_MULTIPART_AGE = 3600
+local MAX_MULTIPART_IDLE = 120
+local MULTIPART_CLEANUP_INTERVAL = 30
+
+-- Discard any legacy, unaccounted reassembly state when upgrading the library.
+AceComm.multipart_spool = {}
 
 --- Register for Addon Traffic on a specified prefix
 -- @param prefix A printable character (\032-\255) classification of the message (typically AddonName or AddonNameEvent), max 16 characters
@@ -142,13 +153,15 @@ end
 -- Message receiving
 ----------------------------------------
 
+local cleanupMultipartSpool, clearMultipartPrefix
+
 do
 	local compost = setmetatable({}, {__mode = "k"})
 	local function new()
 		local t = next(compost)
 		if t then
 			compost[t]=nil
-			for i=#t,3,-1 do	-- faster than pairs loop. don't even nil out 1/2 since they'll be overwritten
+			for i=#t,1,-1 do
 				t[i]=nil
 			end
 			return t
@@ -157,65 +170,174 @@ do
 		return {}
 	end
 
-	local function lostdatawarning(prefix,sender,where)
-		DEFAULT_CHAT_FRAME:AddMessage(MAJOR..": Warning: lost network data regarding '"..tostring(prefix).."' from '"..tostring(sender).."' (in "..where..")")
+	local spool = AceComm.multipart_spool
+	local senderUsage = {}
+	local activeBytes, activeParts, activeStreams, activeSenders = 0, 0, 0, 0
+
+	local function streamKey(prefix, distribution, sender)
+		return prefix.."\t"..distribution.."\t"..sender
 	end
 
-	function AceComm:OnReceiveMultipartFirst(prefix, message, distribution, sender)
-		local key = prefix.."\t"..distribution.."\t"..sender	-- a unique stream is defined by the prefix + distribution + sender
-		local spool = AceComm.multipart_spool
-
-		--[[
-		if spool[key] then
-			lostdatawarning(prefix,sender,"First")
-			-- continue and overwrite
-		end
-		--]]
-
-		spool[key] = message  -- plain string for now
-	end
-
-	function AceComm:OnReceiveMultipartNext(prefix, message, distribution, sender)
-		local key = prefix.."\t"..distribution.."\t"..sender	-- a unique stream is defined by the prefix + distribution + sender
-		local spool = AceComm.multipart_spool
-		local olddata = spool[key]
-
-		if not olddata then
-			--lostdatawarning(prefix,sender,"Next")
-			return
-		end
-
-		if type(olddata)~="table" then
-			-- ... but what we have is not a table. So make it one. (Pull a composted one if available)
-			local t = new()
-			t[1] = olddata    -- add old data as first string
-			t[2] = message    -- and new message as second string
-			spool[key] = t    -- and put the table in the spool instead of the old string
-		else
-			tinsert(olddata, message)
-		end
-	end
-
-	function AceComm:OnReceiveMultipartLast(prefix, message, distribution, sender)
-		local key = prefix.."\t"..distribution.."\t"..sender	-- a unique stream is defined by the prefix + distribution + sender
-		local spool = AceComm.multipart_spool
-		local olddata = spool[key]
-
-		if not olddata then
-			--lostdatawarning(prefix,sender,"End")
+	local function discardStream(key, recycleParts)
+		local stream = spool[key]
+		if not stream then
 			return
 		end
 
 		spool[key] = nil
+		activeBytes = activeBytes - stream.bytes
+		activeParts = activeParts - stream.partCount
+		activeStreams = activeStreams - 1
 
-		if type(olddata) == "table" then
-			-- if we've received a "next", the spooled data will be a table for rapid & garbage-free tconcat
-			tinsert(olddata, message)
-			AceComm.callbacks:Fire(prefix, tconcat(olddata, ""), distribution, sender)
-			compost[olddata] = true
-		else
-			-- if we've only received a "first", the spooled data will still only be a string
-			AceComm.callbacks:Fire(prefix, olddata..message, distribution, sender)
+		local usage = senderUsage[stream.sender]
+		usage.bytes = usage.bytes - stream.bytes
+		usage.parts = usage.parts - stream.partCount
+		usage.streams = usage.streams - 1
+		if usage.streams == 0 then
+			senderUsage[stream.sender] = nil
+			activeSenders = activeSenders - 1
+		end
+
+		if recycleParts ~= false then
+			compost[stream.parts] = true
+		end
+
+		return stream
+	end
+
+	local function cleanupExpiredStreams(now)
+		for key, stream in pairs(spool) do
+			if now - stream.started >= MAX_MULTIPART_AGE or now - stream.updated >= MAX_MULTIPART_IDLE then
+				discardStream(key)
+			end
+		end
+	end
+
+	local function canStartStream(sender, bytes)
+		local usage = senderUsage[sender]
+		if bytes > MAX_MULTIPART_BYTES or activeBytes + bytes > MAX_GLOBAL_BYTES
+			or activeParts + 1 > MAX_GLOBAL_PARTS or activeStreams + 1 > MAX_GLOBAL_STREAMS then
+			return false
+		end
+		if not usage then
+			return activeSenders + 1 <= MAX_GLOBAL_SENDERS
+		end
+		return usage.bytes + bytes <= MAX_SENDER_BYTES
+			and usage.parts + 1 <= MAX_SENDER_PARTS
+			and usage.streams + 1 <= MAX_SENDER_STREAMS
+	end
+
+	local function canAppendStream(stream, bytes, now)
+		local usage = senderUsage[stream.sender]
+		return now - stream.started < MAX_MULTIPART_AGE
+			and now - stream.updated < MAX_MULTIPART_IDLE
+			and stream.bytes + bytes <= MAX_MULTIPART_BYTES
+			and stream.partCount + 1 <= MAX_MULTIPART_PARTS
+			and usage.bytes + bytes <= MAX_SENDER_BYTES
+			and usage.parts + 1 <= MAX_SENDER_PARTS
+			and activeBytes + bytes <= MAX_GLOBAL_BYTES
+			and activeParts + 1 <= MAX_GLOBAL_PARTS
+	end
+
+	local function appendStream(stream, message, now)
+		local bytes = #message
+		stream.bytes = stream.bytes + bytes
+		stream.partCount = stream.partCount + 1
+		stream.updated = now
+		tinsert(stream.parts, message)
+
+		local usage = senderUsage[stream.sender]
+		usage.bytes = usage.bytes + bytes
+		usage.parts = usage.parts + 1
+		activeBytes = activeBytes + bytes
+		activeParts = activeParts + 1
+	end
+
+	function AceComm:OnReceiveMultipartFirst(prefix, message, distribution, sender)
+		local now = GetTime()
+		local key = streamKey(prefix, distribution, sender)
+		cleanupExpiredStreams(now)
+		discardStream(key)
+
+		local bytes = #message
+		if not canStartStream(sender, bytes) then
+			return
+		end
+
+		local usage = senderUsage[sender]
+		if not usage then
+			usage = { bytes = 0, parts = 0, streams = 0 }
+			senderUsage[sender] = usage
+			activeSenders = activeSenders + 1
+		end
+
+		local parts = new()
+		parts[1] = message
+		spool[key] = {
+			bytes = bytes,
+			partCount = 1,
+			parts = parts,
+			prefix = prefix,
+			sender = sender,
+			started = now,
+			updated = now,
+		}
+		usage.bytes = usage.bytes + bytes
+		usage.parts = usage.parts + 1
+		usage.streams = usage.streams + 1
+		activeBytes = activeBytes + bytes
+		activeParts = activeParts + 1
+		activeStreams = activeStreams + 1
+	end
+
+	function AceComm:OnReceiveMultipartNext(prefix, message, distribution, sender)
+		local now = GetTime()
+		local key = streamKey(prefix, distribution, sender)
+		cleanupExpiredStreams(now)
+		local stream = spool[key]
+
+		if not stream then
+			return
+		end
+		if not canAppendStream(stream, #message, now) then
+			discardStream(key)
+			return
+		end
+
+		appendStream(stream, message, now)
+	end
+
+	function AceComm:OnReceiveMultipartLast(prefix, message, distribution, sender)
+		local now = GetTime()
+		local key = streamKey(prefix, distribution, sender)
+		cleanupExpiredStreams(now)
+		local stream = spool[key]
+
+		if not stream then
+			return
+		end
+		if not canAppendStream(stream, #message, now) then
+			discardStream(key)
+			return
+		end
+
+		appendStream(stream, message, now)
+		stream = discardStream(key, false)
+		local parts = stream.parts
+		local completed = tconcat(parts, "")
+		compost[parts] = true
+		AceComm.callbacks:Fire(prefix, completed, distribution, sender)
+	end
+
+	cleanupMultipartSpool = function(now)
+		cleanupExpiredStreams(now or GetTime())
+	end
+
+	clearMultipartPrefix = function(prefix)
+		for key, stream in pairs(spool) do
+			if stream.prefix == prefix then
+				discardStream(key)
+			end
 		end
 	end
 end
@@ -237,10 +359,22 @@ if not AceComm.callbacks then
 end
 
 AceComm.callbacks.OnUsed = nil
-AceComm.callbacks.OnUnused = nil
+AceComm.callbacks.OnUnused = function(_, _, prefix)
+	clearMultipartPrefix(prefix)
+end
+
+local function IsCommRegistered(prefix)
+	local handlers = rawget(AceComm.callbacks.events, prefix)
+	return handlers and next(handlers) ~= nil
+end
 
 local function OnEvent(self, event, prefix, message, distribution, sender)
 	if event == "CHAT_MSG_ADDON" then
+		-- CHAT_MSG_ADDON is global. Ignore multipart control bytes unless an
+		-- AceComm consumer has explicitly registered this prefix.
+		if not IsCommRegistered(prefix) then
+			return
+		end
 		sender = Ambiguate(sender, "none")
 		local control, rest = match(message, "^([\001-\009])(.*)")
 		if control then
@@ -264,8 +398,18 @@ local function OnEvent(self, event, prefix, message, distribution, sender)
 	end
 end
 
+local cleanupElapsed = 0
+local function OnUpdate(self, elapsed)
+	cleanupElapsed = cleanupElapsed + elapsed
+	if cleanupElapsed >= MULTIPART_CLEANUP_INTERVAL then
+		cleanupElapsed = 0
+		cleanupMultipartSpool()
+	end
+end
+
 AceComm.frame = AceComm.frame or CreateFrame("Frame", "AceComm30Frame")
 AceComm.frame:SetScript("OnEvent", OnEvent)
+AceComm.frame:SetScript("OnUpdate", OnUpdate)
 AceComm.frame:UnregisterAllEvents()
 AceComm.frame:RegisterEvent("CHAT_MSG_ADDON")
 
