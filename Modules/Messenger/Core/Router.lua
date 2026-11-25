@@ -301,6 +301,77 @@ end
 
 local deferred = {}
 local drainTicker
+local deferredLineIDs = {}
+local deferredSenderCounts = {}
+local unknownDeferredSenders = {}
+
+local DEFERRED_MAX_AGE = 120
+local DEFERRED_MAX_PER_SENDER = 20
+local DEFERRED_MAX_TOTAL = 100
+local DEFERRED_DRAIN_BATCH = 10
+
+---@param event string
+---@param sender any
+---@return string|table
+local function DeferredSenderKey(event, sender)
+	local readable = U.Str(sender)
+	if readable then
+		return strlower(readable)
+	end
+	-- Secret senders cannot be table keys. Share a conservative bucket for each finite event kind.
+	local key = unknownDeferredSenders[event]
+	if not key then
+		key = {}
+		unknownDeferredSenders[event] = key
+	end
+	return key
+end
+
+---@param item table
+local function ForgetDeferred(item)
+	deferredLineIDs[item.lineID] = nil
+	local count = deferredSenderCounts[item.senderKey]
+	if count and count > 1 then
+		deferredSenderCounts[item.senderKey] = count - 1
+	else
+		deferredSenderCounts[item.senderKey] = nil
+	end
+end
+
+---@param index number
+local function RemoveDeferredAt(index)
+	local item = table.remove(deferred, index)
+	if item then
+		ForgetDeferred(item)
+	end
+end
+
+---@param senderKey string|table
+local function DropOldestForSender(senderKey)
+	for i, item in ipairs(deferred) do
+		if item.senderKey == senderKey then
+			RemoveDeferredAt(i)
+			return
+		end
+	end
+end
+
+---@param now number
+---@return boolean changed
+local function ExpireDeferred(now)
+	local remaining = {}
+	local changed = false
+	for _, item in ipairs(deferred) do
+		if now - item.t < DEFERRED_MAX_AGE then
+			remaining[#remaining + 1] = item
+		else
+			ForgetDeferred(item)
+			changed = true
+		end
+	end
+	deferred = remaining
+	return changed
+end
 
 local function StopTicker()
 	if drainTicker then
@@ -315,16 +386,23 @@ function R:HasDeferred()
 end
 
 local function Drain()
+	local changed = ExpireDeferred(time())
 	if #deferred == 0 then
 		StopTicker()
+		if changed then
+			M:Fire('RESTRICTION_CHANGED')
+		end
 		return
 	end
 	if U.IsRestricted() then
+		if changed then
+			M:Fire('RESTRICTION_CHANGED')
+		end
 		return
 	end
-	local remaining = {}
-	local now = time()
-	for _, item in ipairs(deferred) do
+	local batchSize = math.min(#deferred, DEFERRED_DRAIN_BATCH)
+	for _ = 1, batchSize do
+		local item = table.remove(deferred, 1)
 		local okText, text = pcall(C_ChatInfo.GetChatLineText, item.lineID)
 		local okSender, sender = pcall(C_ChatInfo.GetChatLineSenderName, item.lineID)
 		local okGuid, guid = pcall(C_ChatInfo.GetChatLineSenderGUID, item.lineID)
@@ -332,6 +410,7 @@ local function Drain()
 		sender = okSender and U.Str(sender) or nil
 		guid = okGuid and U.Str(guid) or nil
 		if text and sender then
+			ForgetDeferred(item)
 			local bnID
 			local kind = M.KindByEvent[item.event]
 			if kind and kind.key == 'BN_WHISPER' then
@@ -343,11 +422,11 @@ local function Drain()
 			else
 				M.log.debug('Could not place a restricted Battle.net line after the fight')
 			end
-		elseif now - item.t < 120 then
-			table.insert(remaining, item)
+		else
+			-- Rotate an unreadable line behind the rest so one line cannot starve the queue.
+			deferred[#deferred + 1] = item
 		end
 	end
-	deferred = remaining
 	if #deferred == 0 then
 		StopTicker()
 	end
@@ -356,22 +435,37 @@ end
 
 ---@param event string
 ---@param lineID any
+---@param sender any
 ---@param flags any
 ---@param channelBase any
 ---@param channelString any
-local function Defer(event, lineID, flags, channelBase, channelString)
+local function Defer(event, lineID, sender, flags, channelBase, channelString)
 	lineID = U.Num(lineID)
 	if not lineID or not (C_ChatInfo and C_ChatInfo.GetChatLineText) then
 		return
 	end
-	table.insert(deferred, {
+	if deferredLineIDs[lineID] then
+		return
+	end
+	local senderKey = DeferredSenderKey(event, sender)
+	if (deferredSenderCounts[senderKey] or 0) >= DEFERRED_MAX_PER_SENDER then
+		DropOldestForSender(senderKey)
+	end
+	if #deferred >= DEFERRED_MAX_TOTAL then
+		RemoveDeferredAt(1)
+	end
+	local item = {
 		event = event,
 		lineID = lineID,
+		senderKey = senderKey,
 		flags = flags,
 		channelBase = U.Str(channelBase),
 		channelString = U.Str(channelString),
 		t = time(),
-	})
+	}
+	deferred[#deferred + 1] = item
+	deferredLineIDs[lineID] = true
+	deferredSenderCounts[senderKey] = (deferredSenderCounts[senderKey] or 0) + 1
 	if not drainTicker then
 		drainTicker = C_Timer.NewTicker(2, Drain)
 	end
@@ -432,7 +526,7 @@ local function OnChatEvent(event, ...)
 		return
 	end
 	if U.AnySecret(text, sender, guid, bnID) then
-		Defer(event, lineID, flags, channelBase, channelString)
+		Defer(event, lineID, sender, flags, channelBase, channelString)
 		return
 	end
 	text = U.Str(text)
@@ -479,7 +573,7 @@ end
 -- Normal chat window filter
 ----------------------------------------------------------------------------------------------------
 
-local function ShouldHide(event, text, sender, flags, channelBase, lineID, bnID)
+local function ShouldHide(event, text, sender, guid, bnID, flags, channelBase, lineID)
 	local kind = M.KindByEvent[event]
 	if not kind then
 		return false
@@ -488,22 +582,19 @@ local function ShouldHide(event, text, sender, flags, channelBase, lineID, bnID)
 	if not route or not route.hide then
 		return false
 	end
-	if not route.capture or IsStaff(flags) or U.AnySecret(text, sender) or not U.Str(text) or IsCensored(lineID) then
-		return false
-	end
-	if kind.key == 'BN_WHISPER' and U.IsSecret(bnID) then
+	if not route.capture or IsStaff(flags) or U.AnySecret(text, sender, guid, bnID) or not U.Str(text) or IsCensored(lineID) then
 		return false
 	end
 	local key = KeyFor(kind, sender, bnID, channelBase)
 	return key ~= nil and Wanted(kind, key, U.Str(channelBase))
 end
 
-local function ChatFilter(_, event, text, sender, _, _, _, flags, _, channelIndex, channelBase, _, lineID, _, bnID)
+local function ChatFilter(_, event, text, sender, _, _, _, flags, _, channelIndex, channelBase, _, lineID, guid, bnID)
 	if not M.enabled or checkingOthers then
 		return false
 	end
 	channelBase = event == 'CHAT_MSG_CHANNEL' and U.ChannelName(channelIndex, channelBase) or nil
-	local ok, hide = pcall(ShouldHide, event, text, sender, flags, channelBase, lineID, bnID)
+	local ok, hide = pcall(ShouldHide, event, text, sender, guid, bnID, flags, channelBase, lineID)
 	return ok and hide == true
 end
 
