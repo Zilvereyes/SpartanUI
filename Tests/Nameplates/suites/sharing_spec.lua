@@ -228,7 +228,7 @@ describe('sharing page: wording and validity', function()
 		assert.truthy(#texts > 20, 'the page has text to check')
 		Store:Set('style', 'clean')
 		-- Everything the import box can say back
-		local newerText = '!NP:' .. (Schema.CURRENT + 1) .. ':style!zz'
+		local newerText = '!NP:' .. (Schema.CURRENT + 1) .. ':style:raw!zz'
 		for _, text in ipairs({ 'hello', '', string.rep('a', Exchange.MAX_LENGTH + 1), newerText, Share:Encode('colors', { scheme = 'class' }) }) do
 			local info, reason = Exchange:Inspect(text)
 			if info then
@@ -467,7 +467,7 @@ describe('export', function()
 		local box = Page().args.export.args.exportText
 		Store:Set('style', 'clean')
 		local first = box.get()
-		assert.matches(first, '^!NP:' .. Schema.CURRENT .. ':style!')
+		assert.matches(first, '^!NP:' .. Schema.CURRENT .. ':style:raw!')
 		local cache = Sharing.cache
 		assert.equal(box.get(), first)
 		assert.equal(Sharing.cache, cache, 'same cache entry')
@@ -479,7 +479,7 @@ describe('export', function()
 		local page = Page()
 		local args = page.args.export.args
 		args.what.set({}, 'colors')
-		assert.matches(args.exportText.get(), '^!NP:' .. Schema.CURRENT .. ':colors!')
+		assert.matches(args.exportText.get(), '^!NP:' .. Schema.CURRENT .. ':colors:raw!')
 		assert.is_true(args.style.hidden())
 		assert.is_true(args.version.hidden())
 		args.what.set({}, 'style')
@@ -526,7 +526,7 @@ describe('import: reading a string', function()
 		assert.equal(reason, 'format')
 		_, reason = Exchange:Inspect(string.rep('a', Exchange.MAX_LENGTH + 1))
 		assert.equal(reason, 'tooLong')
-		local newer = '!NP:' .. (Schema.CURRENT + 1) .. ':style!abcd'
+		local newer = '!NP:' .. (Schema.CURRENT + 1) .. ':style:raw!abcd'
 		_, reason = Exchange:Inspect(newer)
 		assert.equal(reason, 'newer')
 		assert.matches(Exchange:ReasonText('newer'), P:HostName())
@@ -919,7 +919,7 @@ describe('import: using a string', function()
 		import.importClear.func()
 		assert.is_true(import.importClear.hidden())
 		assert.matches(import.importInfo.name(), '^Paste a share string')
-		import.importText.set({}, '!NP:' .. (Schema.CURRENT + 1) .. ':style!x')
+		import.importText.set({}, '!NP:' .. (Schema.CURRENT + 1) .. ':style:raw!x')
 		assert.matches(import.importInfo.name(), P:HostName())
 		import.importText.set({}, '')
 		assert.matches(import.importInfo.name(), '^Paste a share string', 'an empty box is not an error')
@@ -1128,7 +1128,7 @@ describe('public API: ImportStyle', function()
 		id, reason = P.API:ImportStyle('nope')
 		assert.is_nil(id)
 		assert.equal(reason, 'format')
-		id, reason = P.API:ImportStyle('!NP:' .. (Schema.CURRENT + 1) .. ':style!zz')
+		id, reason = P.API:ImportStyle('!NP:' .. (Schema.CURRENT + 1) .. ':style:raw!zz')
 		assert.equal(reason, 'newer')
 	end)
 
@@ -1219,34 +1219,53 @@ describe('share: size limits', function()
 		assert.is_true(ok, tostring(err))
 	end
 
-	it('refuses a packed string over the limit before unpacking it', function()
-		local unpacked = 0
+	it('refuses an encoded string over the limit before decoding it', function()
+		local decodedBodies = 0
 		With({
-			DecompressString = function(original)
+			DecodeBase64 = function(original)
 				return function(text)
-					unpacked = unpacked + 1
+					decodedBodies = decodedBodies + 1
 					return original(text)
 				end
 			end,
 		}, function()
-			local body = string.rep('A', math.ceil(Share.MAX_COMPRESSED / 3) * 4 + 4)
-			local decoded, reason = Share:Decode('!NP:' .. Schema.CURRENT .. ':style!' .. body)
+			local body = string.rep('A', Share.MAX_ENCODED + 4)
+			local text = '!NP:' .. Schema.CURRENT .. ':style:raw!' .. body
+			local decoded, reason = Share:Decode(text)
 			assert.is_nil(decoded)
 			assert.equal(reason, 'tooLong')
-			local info, why = Exchange:Inspect('!NP:' .. Schema.CURRENT .. ':style!' .. body)
+			local info, why = Exchange:Inspect(text)
 			assert.is_nil(info)
 			assert.equal(why, 'tooLong')
 		end)
-		assert.equal(unpacked, 0, 'nothing was unpacked')
+		assert.equal(decodedBodies, 0, 'nothing was decoded')
 	end)
 
-	it('refuses an unpacked string over the limit before reading it', function()
+	it('refuses base64 whose decoded length exceeds the limit', function()
+		local decodedBodies = 0
+		With({
+			DecodeBase64 = function(original)
+				return function(text)
+					decodedBodies = decodedBodies + 1
+					return original(text)
+				end
+			end,
+		}, function()
+			local body = string.rep('A', Share.MAX_ENCODED)
+			local decoded, reason = Share:Decode('!NP:' .. Schema.CURRENT .. ':style:raw!' .. body)
+			assert.is_nil(decoded)
+			assert.equal(reason, 'tooLong')
+		end)
+		assert.equal(decodedBodies, 0, 'oversized decoded data was not allocated')
+	end)
+
+	it('refuses decoded CBOR over the limit before reading it', function()
 		local text = Share:Encode('colors', { scheme = 'class' })
 		local read = 0
 		With({
-			DecompressString = function()
+			DecodeBase64 = function()
 				return function()
-					return string.rep('x', Share.MAX_DECOMPRESSED + 1)
+					return string.rep('x', Share.MAX_SERIALIZED + 1)
 				end
 			end,
 			DeserializeCBOR = function(original)
@@ -1265,6 +1284,27 @@ describe('share: size limits', function()
 			assert.is_nil((P.API:ImportStyle(text)))
 		end)
 		assert.equal(read, 0, 'nothing was read')
+	end)
+
+	it('refuses legacy compressed strings without decompressing them', function()
+		local decompressed = 0
+		With({
+			DecompressString = function(original)
+				return function(text)
+					decompressed = decompressed + 1
+					return original(text)
+				end
+			end,
+		}, function()
+			local legacy = '!NP:' .. Schema.CURRENT .. ':colors!' .. EncodeBase64(MARK .. Serialize({ scheme = 'class' }))
+			local decoded, reason = Share:Decode(legacy)
+			assert.is_nil(decoded)
+			assert.equal(reason, 'format')
+			local info, why = Exchange:Inspect(legacy)
+			assert.is_nil(info)
+			assert.equal(why, 'format')
+		end)
+		assert.equal(decompressed, 0, 'legacy data never reaches the decompressor')
 	end)
 
 	it('says so in plain words', function()
@@ -1293,7 +1333,7 @@ describe('share: one read per string', function()
 
 	local function Counting(fn)
 		local E = C_EncodingUtil
-		local names = { 'DecodeBase64', 'DecompressString', 'DeserializeCBOR' }
+		local names = { 'DecodeBase64', 'DeserializeCBOR' }
 		local originals, counts = {}, {}
 		for _, name in ipairs(names) do
 			originals[name] = E[name]
@@ -1316,7 +1356,7 @@ describe('share: one read per string', function()
 		local counts = Counting(function()
 			assert.not_nil(Exchange:Inspect(text))
 		end)
-		assert.same(counts, { DecodeBase64 = 1, DecompressString = 1, DeserializeCBOR = 1 })
+		assert.same(counts, { DecodeBase64 = 1, DeserializeCBOR = 1 })
 	end)
 
 	it('decodes a style string once when it is imported through the public function', function()
@@ -1324,7 +1364,7 @@ describe('share: one read per string', function()
 		local counts = Counting(function()
 			assert.not_nil((P.API:ImportStyle(text)))
 		end)
-		assert.same(counts, { DecodeBase64 = 1, DecompressString = 1, DeserializeCBOR = 1 })
+		assert.same(counts, { DecodeBase64 = 1, DeserializeCBOR = 1 })
 	end)
 
 	it('decodes a style string once when it is checked on its own', function()
@@ -1333,7 +1373,7 @@ describe('share: one read per string', function()
 			assert.not_nil(Share:InspectStyle(text))
 			assert.not_nil((Share:ImportStyle(text)))
 		end)
-		assert.same(counts, { DecodeBase64 = 2, DecompressString = 2, DeserializeCBOR = 2 }, 'once for each call, never twice in one')
+		assert.same(counts, { DecodeBase64 = 2, DeserializeCBOR = 2 }, 'once for each call, never twice in one')
 	end)
 
 	it('checks a string that was read already', function()
