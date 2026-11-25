@@ -212,6 +212,9 @@ local function emojiFilter(chatFrame, event, msg, ...)
 	if not module.CurrentSettings or not module.CurrentSettings.emoji or not module.CurrentSettings.emoji.enabled then
 		return
 	end
+	if not SUI.BlizzAPI.canaccessvalue(msg) then
+		return
+	end
 	local newMsg = GetSmileyReplacementText(msg)
 	if newMsg ~= msg then
 		return false, newMsg, ...
