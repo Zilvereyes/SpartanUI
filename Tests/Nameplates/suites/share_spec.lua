@@ -1,9 +1,10 @@
 -- @runtime lua51
--- Share strings (plan 3.6, contracts 12): "!NP:<schema>:<kind>!<body>" round trips for every kind,
+-- Share strings (plan 3.6, contracts 12): "!NP:<schema>:<kind>:raw!<body>" round trips for every kind,
 -- bad strings are refused with a reason, strings from a newer version are never imported, and a
 -- style import is upgraded, validated, saved, and can later update its base while the player's
 -- own changes stay. The mock client has no codec, so this suite installs a plain stand-in for
--- C_EncodingUtil (a Lua-literal serializer, a marker for compression and real base64).
+-- C_EncodingUtil (a Lua-literal serializer and real base64). Compression remains only to build a
+-- legacy string that the current reader must reject without unpacking.
 local M, H = ...
 
 if not H.ModuleExists() then
@@ -129,7 +130,7 @@ P.services.FontPath = function()
 end
 
 local function Body(kind, payload, schema)
-	return '!NP:' .. (schema or P.VERSION.schema) .. ':' .. kind .. '!' .. EncodeBase64(MARK .. Serialize(payload))
+	return '!NP:' .. (schema or P.VERSION.schema) .. ':' .. kind .. ':raw!' .. EncodeBase64(Serialize(payload))
 end
 
 describe('share: strings', function()
@@ -143,7 +144,7 @@ describe('share: strings', function()
 		for kind, payload in pairs(payloads) do
 			local text, reason = Share:Encode(kind, payload)
 			assert.not_nil(text, kind .. ': ' .. tostring(reason))
-			assert.matches(text, '^!NP:' .. P.VERSION.schema .. ':' .. kind .. '!')
+			assert.matches(text, '^!NP:' .. P.VERSION.schema .. ':' .. kind .. ':raw!')
 			local decoded, why = Share:Decode(text)
 			assert.not_nil(decoded, kind .. ': ' .. tostring(why))
 			assert.equal(decoded.kind, kind)
@@ -179,11 +180,12 @@ describe('share: strings', function()
 		{ '!NP:style!abcd', 'format' },
 		{ '!NP:x:style!abcd', 'format' },
 		{ '!NP:1:style!', 'format' },
-		{ '!NP:1:banana!' .. EncodeBase64(MARK .. '{}'), 'kind' },
-		{ '!NP:1:style!@@@@', 'decode' },
-		{ '!NP:1:style!' .. EncodeBase64('not compressed'), 'decode' },
-		{ '!NP:1:style!' .. EncodeBase64(MARK .. 'return os.exit()'), 'decode' },
-		{ '!NP:1:style!' .. EncodeBase64(MARK .. '"just text"'), 'decode' },
+		{ '!NP:1:banana:raw!' .. EncodeBase64('{}'), 'kind' },
+		{ '!NP:1:style:raw!@@@@', 'decode' },
+		{ '!NP:1:style:zip!' .. EncodeBase64(MARK .. '{}'), 'format' },
+		{ '!NP:1:style!' .. EncodeBase64(MARK .. '{}'), 'format' },
+		{ '!NP:1:style:raw!' .. EncodeBase64('return os.exit()'), 'decode' },
+		{ '!NP:1:style:raw!' .. EncodeBase64('"just text"'), 'decode' },
 	}
 	for i, case in ipairs(bad) do
 		it(('refuses bad string %d with "%s"'):format(i, case[2]), function()
@@ -206,7 +208,7 @@ describe('share: strings', function()
 		local decoded, reason = Share:Decode(newer)
 		assert.is_nil(decoded)
 		assert.equal(reason, 'newer')
-		decoded, reason = Share:Decode('!NP:' .. (P.VERSION.schema + 1) .. ':style!garbage')
+		decoded, reason = Share:Decode('!NP:' .. (P.VERSION.schema + 1) .. ':style:raw!garbage')
 		assert.equal(reason, 'newer', 'even with a broken body')
 		local id, why = Share:ImportStyle(newer)
 		assert.is_nil(id)

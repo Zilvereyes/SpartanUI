@@ -559,7 +559,7 @@ describe('when actions: sharing', function()
 	end)
 
 	it('refuses a whole string from a newer format', function()
-		local text = '!NP:' .. (P.Styles.Schema.CURRENT + 1) .. ':when!AAAA'
+		local text = '!NP:' .. (P.Styles.Schema.CURRENT + 1) .. ':when:raw!AAAA'
 		local decoded, reason = P.Share:Decode(text)
 		assert.is_nil(decoded)
 		assert.equal(reason, 'newer')

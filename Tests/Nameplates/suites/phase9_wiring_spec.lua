@@ -650,7 +650,7 @@ describe('share format 2: "When" strings carry the rules', function()
 		if not text then
 			skip('this client cannot make share strings')
 		end
-		assert.matches(text, '^!NP:2:when!')
+		assert.matches(text, '^!NP:2:when:raw!')
 		local decoded = assert(Share:Decode(text))
 		assert.same(P.Actions:SharePayload(), decoded.payload)
 		local info = assert(Exchange:Inspect(text))
@@ -734,7 +734,7 @@ describe('share format 2: "When" strings carry the rules', function()
 	end)
 
 	it('refuses a whole string from a newer format', function()
-		local decoded, reason = Share:Decode('!NP:' .. (Schema.CURRENT + 1) .. ':when!AAAA')
+		local decoded, reason = Share:Decode('!NP:' .. (Schema.CURRENT + 1) .. ':when:raw!AAAA')
 		assert.is_nil(decoded)
 		assert.equal('newer', reason)
 	end)

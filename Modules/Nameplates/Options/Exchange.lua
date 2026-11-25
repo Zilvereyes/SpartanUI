@@ -23,7 +23,7 @@ local Registry, Merge, Schema = P.Styles.Registry, P.Styles.Merge, P.Styles.Sche
 local util = P.util
 
 ---Longest text Inspect looks at, before it reads anything (a whole profile with styles is far
----smaller). P.Share then caps the packed and unpacked sizes.
+---smaller). P.Share then caps the encoded and serialized sizes.
 Exchange.MAX_LENGTH = 400000
 
 ---Profile keys a profile string carries. Role, game settings (cvars) and the host switches stay
@@ -1410,7 +1410,7 @@ end
 ---@param what 'style'|'colors'|'when'|'everything'
 ---@param opts? { styleId?: string, version?: integer, author?: string }
 ---@return string|nil text
----@return string|nil reason 'missing' | 'unavailable' | 'encode' | 'kind'
+---@return string|nil reason 'missing' | 'unavailable' | 'encode' | 'kind' | 'tooLong'
 function Exchange:BuildExport(what, opts)
 	opts = opts or {}
 	local Store = P.Store

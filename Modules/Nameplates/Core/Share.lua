@@ -3,11 +3,11 @@ local P = ns.Plates
 local L = P.L
 
 -- Share strings (3.6, Phase 5 for the UI). Format:
---   !NP:<schema>:<kind>!<base64(deflate(cbor(payload)))>
+--   !NP:<schema>:<kind>:raw!<base64(cbor(payload))>
 -- The prefix names no product, so strings stay valid if the module ever ships on its own.
--- Built only with C_EncodingUtil (SerializeCBOR, CompressString, EncodeBase64), documented on all
--- six clients. A string from a newer schema is refused, never imported quietly. Everything is
--- upgraded through the same chain as saved styles and checked by the part schema.
+-- Built only with C_EncodingUtil (SerializeCBOR and Base64), documented on all six clients. A
+-- string from a newer schema is refused, never imported quietly. Everything is upgraded through
+-- the same chain as saved styles and checked by the part schema.
 --
 -- Payloads by kind:
 --   style   { style = <style>, name = string, author? = string, version = integer }
@@ -21,14 +21,15 @@ local Share = {}
 P.Share = Share
 
 Share.PREFIX = '!NP:'
+Share.ENCODING = 'raw'
 Share.KINDS = { style = true, colors = true, when = true, profile = true }
 
--- Size limits for text from other players. C_EncodingUtil.DecompressString has no output limit
--- of its own, so the packed size is capped before it is unpacked (a packed string can grow about
--- a thousand times) and the unpacked size is capped before the reader builds any table from it.
--- A whole profile with several styles is far under both.
-Share.MAX_COMPRESSED = 120000
-Share.MAX_DECOMPRESSED = 1000000
+-- Size limits for text from other players. Share bodies are deliberately not compressed because
+-- C_EncodingUtil.DecompressString cannot stop at an addon-provided output limit. Base64 has a
+-- fixed expansion ratio, so its text can be capped before decoding and the decoded CBOR can be
+-- checked again before the reader builds any table from it. A whole profile is far under the cap.
+Share.MAX_SERIALIZED = 1000000
+Share.MAX_ENCODED = math.ceil(Share.MAX_SERIALIZED / 3) * 4
 
 ---@class Plates.ShareDecoded
 ---@field kind string
@@ -37,7 +38,7 @@ Share.MAX_DECOMPRESSED = 1000000
 
 local function Codec()
 	local E = C_EncodingUtil
-	if not (E and E.SerializeCBOR and E.DeserializeCBOR and E.CompressString and E.DecompressString and E.EncodeBase64 and E.DecodeBase64) then
+	if not (E and E.SerializeCBOR and E.DeserializeCBOR and E.EncodeBase64 and E.DecodeBase64) then
 		return nil
 	end
 	return E
@@ -47,7 +48,7 @@ end
 ---@param kind string
 ---@param payload table
 ---@return string|nil text
----@return string|nil reason 'kind' | 'unavailable' | 'encode'
+---@return string|nil reason 'kind' | 'unavailable' | 'encode' | 'tooLong'
 function Share:Encode(kind, payload)
 	if not self.KINDS[kind] then
 		return nil, 'kind'
@@ -56,13 +57,21 @@ function Share:Encode(kind, payload)
 	if not E then
 		return nil, 'unavailable'
 	end
-	local ok, text = pcall(function()
-		return E.EncodeBase64(E.CompressString(E.SerializeCBOR(payload)))
-	end)
-	if not ok or type(text) ~= 'string' then
+	local okRaw, raw = pcall(E.SerializeCBOR, payload)
+	if not okRaw or type(raw) ~= 'string' then
 		return nil, 'encode'
 	end
-	return self.PREFIX .. P.Styles.Schema.CURRENT .. ':' .. kind .. '!' .. text
+	if #raw > self.MAX_SERIALIZED then
+		return nil, 'tooLong'
+	end
+	local okText, body = pcall(E.EncodeBase64, raw)
+	if not okText or type(body) ~= 'string' then
+		return nil, 'encode'
+	end
+	if #body > self.MAX_ENCODED then
+		return nil, 'tooLong'
+	end
+	return self.PREFIX .. P.Styles.Schema.CURRENT .. ':' .. kind .. ':' .. self.ENCODING .. '!' .. body
 end
 
 local function Clean(text)
@@ -87,7 +96,7 @@ end
 ---@return string|nil reason 'format' | 'newer' | 'kind' | 'unavailable' | 'decode' | 'tooLong'
 function Share:Decode(text)
 	text = Clean(text)
-	local schema, kind, body = string.match(text, '^!NP:(%d+):(%a+)!(.+)$')
+	local schema, kind, encoding, body = string.match(text, '^!NP:(%d+):(%a+):(%a+)!(.+)$')
 	if not schema then
 		return nil, 'format'
 	end
@@ -98,27 +107,32 @@ function Share:Decode(text)
 	if not self.KINDS[kind] then
 		return nil, 'kind'
 	end
+	-- Unmarked legacy bodies are compressed. Never pass one to the unbounded native decompressor.
+	if encoding ~= self.ENCODING then
+		return nil, 'format'
+	end
 	local E = Codec()
 	if not E then
 		return nil, 'unavailable'
 	end
 	body = string.gsub(body, '%s', '')
 	-- Base64 writes 4 characters for every 3 bytes
-	if #body > math.ceil(self.MAX_COMPRESSED / 3) * 4 then
+	if #body > self.MAX_ENCODED then
 		return nil, 'tooLong'
 	end
-	local okPacked, packed = pcall(E.DecodeBase64, body)
-	if not okPacked or type(packed) ~= 'string' then
+	local padding = string.match(body, '=+$')
+	if padding and #padding > 2 then
 		return nil, 'decode'
 	end
-	if #packed > self.MAX_COMPRESSED then
+	local decodedLimit = math.ceil(#body / 4) * 3 - (padding and #padding or 0)
+	if decodedLimit > self.MAX_SERIALIZED then
 		return nil, 'tooLong'
 	end
-	local okRaw, raw = pcall(E.DecompressString, packed)
+	local okRaw, raw = pcall(E.DecodeBase64, body)
 	if not okRaw or type(raw) ~= 'string' then
 		return nil, 'decode'
 	end
-	if #raw > self.MAX_DECOMPRESSED then
+	if #raw > self.MAX_SERIALIZED then
 		return nil, 'tooLong'
 	end
 	local okPayload, payload = pcall(E.DeserializeCBOR, raw)
